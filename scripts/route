@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""route: walking, cycling and public-transport times between two places, from routing services.
+
+Backends: postcodes.io and Nominatim (place lookup), the FOSSGIS OSRM routers on
+routing.openstreetmap.de (walk and cycle, worldwide), the TfL Journey Planner (London), and
+Google Routes API (transit outside London; key from GOOGLE_MAPS_API_KEY, else read with
+gcloud from the project in PROJECT). Standard library only.
+"""
+import argparse
+import datetime
+import json
+import os
+import math
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from zoneinfo import ZoneInfo
+
+UA = "find-route/1.0 (+https://github.com/HartreeWorks/skill--find-route)"  # Nominatim requires an identifying agent
+PROJECT = ""  # optional: Google Cloud project whose "API key 1" gcloud reads when GOOGLE_MAPS_API_KEY is unset
+KEY_DISPLAY_NAME = "API key 1"
+LONDON = (51.28, 51.70, -0.52, 0.34)  # rough Greater London bounding box: lat min/max, lng min/max
+UK_POSTCODE = re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$", re.I)
+LATLNG = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
+
+
+class RouteError(Exception):
+    pass
+
+
+def fetch(url, data=None, headers=None):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            return json.loads(body)
+        except ValueError:
+            raise RouteError(f"HTTP {e.code} from {urllib.parse.urlsplit(url).netloc}: {body[:300]}")
+    except urllib.error.URLError as e:
+        raise RouteError(f"cannot reach {urllib.parse.urlsplit(url).netloc}: {e.reason}")
+
+
+def geocode(text):
+    """Return (lat, lng, label) for a 'lat,lng' pair, a UK postcode or a free-text address."""
+    m = LATLNG.match(text)
+    if m:
+        return float(m[1]), float(m[2]), text.strip()
+    if UK_POSTCODE.match(text.strip()):
+        r = fetch("https://api.postcodes.io/postcodes/" + urllib.parse.quote(text.strip()))
+        if r.get("status") == 200:
+            res = r["result"]
+            return res["latitude"], res["longitude"], f"{res['postcode']} (postcode centroid)"
+    q = urllib.parse.urlencode({"q": text, "format": "jsonv2", "limit": 1})
+    hits = fetch("https://nominatim.openstreetmap.org/search?" + q)
+    if not hits:
+        raise RouteError(f"no location found for {text!r}; try a postcode or 'lat,lng'")
+    return float(hits[0]["lat"]), float(hits[0]["lon"]), hits[0]["display_name"]
+
+
+def in_london(p):
+    return LONDON[0] <= p[0] <= LONDON[1] and LONDON[2] <= p[1] <= LONDON[3]
+
+
+def straight_m(a, b):
+    lat1, lng1, lat2, lng2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lng2 - lng1) / 2) ** 2
+    return 2 * 6371000 * math.asin(math.sqrt(h))
+
+
+def km(m):
+    return f"{m / 1000:.1f} km" if m else "—"
+
+
+def osrm(profile, a, b):
+    url = (f"https://routing.openstreetmap.de/routed-{profile}/route/v1/driving/"
+           f"{a[1]},{a[0]};{b[1]},{b[0]}?overview=false")
+    r = fetch(url)
+    if r.get("code") != "Ok":
+        raise RouteError(f"OSRM {profile}: {r.get('message', r.get('code'))}")
+    route = r["routes"][0]
+    return route["duration"] / 60, route["distance"], ""
+
+
+def tfl(mode, a, b, when, arrive):
+    params = {"mode": mode}
+    if when:
+        local = when.astimezone(ZoneInfo("Europe/London"))
+        params.update(date=local.strftime("%Y%m%d"), time=local.strftime("%H%M"),
+                      timeIs="Arriving" if arrive else "Departing")
+    url = (f"https://api.tfl.gov.uk/Journey/JourneyResults/{a[0]},{a[1]}/to/{b[0]},{b[1]}?"
+           + urllib.parse.urlencode(params))
+    r = fetch(url)
+    journeys = r.get("journeys") or []
+    if not journeys:
+        raise RouteError(f"TfL: {r.get('message', 'no journey found')}")
+    j = journeys[0]
+    # TfL gives reliable distances only for walking and cycling legs, so transit shows none
+    dist = sum(leg.get("distance") or 0 for leg in j["legs"]) if mode == "cycle" else None
+    steps = " → ".join(leg["instruction"]["summary"] for leg in j["legs"])
+    return j["duration"], dist, f"dep {j['startDateTime'][11:16]}, arr {j['arrivalDateTime'][11:16]}: {steps}"
+
+
+def google_key():
+    if os.environ.get("GOOGLE_MAPS_API_KEY"):
+        return os.environ["GOOGLE_MAPS_API_KEY"]
+    if not PROJECT:
+        raise RouteError("set GOOGLE_MAPS_API_KEY (a key with the Routes API enabled) for transit outside London")
+    def gcloud(*args):
+        return subprocess.run(["gcloud", *args], check=True, capture_output=True, text=True).stdout.strip()
+    try:
+        name = gcloud("services", "api-keys", "list", "--project", PROJECT,
+                      f"--filter=displayName={KEY_DISPLAY_NAME!r}", "--format=value(name)")
+        return gcloud("services", "api-keys", "get-key-string", name, "--format=value(keyString)")
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise RouteError(f"Google key lookup failed (gcloud may need 'gcloud auth login'): {e}")
+
+
+def google(mode, a, b, when, arrive):
+    body = {
+        "origin": {"location": {"latLng": {"latitude": a[0], "longitude": a[1]}}},
+        "destination": {"location": {"latLng": {"latitude": b[0], "longitude": b[1]}}},
+        "travelMode": mode,
+    }
+    if when:
+        stamp = when.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        body["arrivalTime" if arrive else "departureTime"] = stamp
+    fields = ("routes.duration,routes.distanceMeters,routes.legs.steps.travelMode,"
+              "routes.legs.steps.transitDetails.transitLine.nameShort,"
+              "routes.legs.steps.transitDetails.transitLine.name,"
+              "routes.legs.steps.transitDetails.stopDetails.departureStop.name,"
+              "routes.legs.steps.transitDetails.stopDetails.arrivalStop.name,"
+              "routes.legs.steps.transitDetails.stopDetails.departureTime")
+    r = fetch("https://routes.googleapis.com/directions/v2:computeRoutes", data=json.dumps(body).encode(),
+              headers={"Content-Type": "application/json", "X-Goog-Api-Key": google_key(),
+                       "X-Goog-FieldMask": fields})
+    if "error" in r:
+        reason = ((r["error"].get("details") or [{}])[0]).get("reason", "")
+        if reason == "SERVICE_DISABLED":
+            raise RouteError("Google Routes API is not enabled in the key's Google Cloud project")
+        raise RouteError(f"Google: {r['error'].get('status')} {r['error'].get('message', '')[:200]}")
+    if not r.get("routes"):
+        raise RouteError("Google: no route found")
+    route = r["routes"][0]
+    parts = []
+    for step in route["legs"][0].get("steps", []):
+        td = step.get("transitDetails")
+        if td:
+            line = td["transitLine"].get("nameShort") or td["transitLine"].get("name", "?")
+            stops = td.get("stopDetails", {})
+            parts.append(f"{line} {stops.get('departureStop', {}).get('name', '?')} → "
+                         f"{stops.get('arrivalStop', {}).get('name', '?')}")
+        elif not parts or parts[-1] != "walk":
+            parts.append("walk")
+    return int(route["duration"].rstrip("s")) / 60, route.get("distanceMeters", 0), " → ".join(parts)
+
+
+def parse_when(text, tz):
+    if not text:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(text.replace(" ", "T"))
+    except ValueError:
+        sys.exit(f"--at must look like '2026-10-17 17:30', got {text!r}")
+    return dt if dt.tzinfo else dt.replace(tzinfo=ZoneInfo(tz))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Travel times between two places from routing services.")
+    ap.add_argument("origin", help="address, UK postcode, or 'lat,lng'")
+    ap.add_argument("destination", help="address, UK postcode, or 'lat,lng'")
+    ap.add_argument("--mode", choices=["walk", "cycle", "transit", "all"], default="all")
+    ap.add_argument("--at", help="local date and time, e.g. '2026-10-17 17:30' (default: leave now)")
+    ap.add_argument("--arrive", action="store_true", help="treat --at as the arrival time (transit)")
+    ap.add_argument("--tz", help="IANA time zone for --at (default Europe/London in London, else required)")
+    args = ap.parse_args()
+
+    try:
+        a, b = geocode(args.origin), geocode(args.destination)
+    except RouteError as e:
+        sys.exit(str(e))
+    london = in_london(a) and in_london(b)
+    tz = args.tz or ("Europe/London" if london else None)
+    if args.at and not tz:
+        sys.exit("--at outside London needs --tz, e.g. --tz Europe/Paris")
+    when = parse_when(args.at, tz)
+
+    print(f"From: {a[2]}  [{a[0]:.5f},{a[1]:.5f}]")
+    print(f"To:   {b[2]}  [{b[0]:.5f},{b[1]:.5f}]")
+    gap = straight_m(a, b)
+    print(f"Straight line: {km(gap)}")
+    if gap > 300_000:
+        print("WARNING: over 300 km apart. Check both places above resolved correctly; "
+              "add the city and country, or use a postcode or 'lat,lng'.")
+    if when:
+        print(f"{'Arrive by' if args.arrive else 'Leave at'}: {when:%Y-%m-%d %H:%M %Z}")
+
+    modes = ["walk", "cycle", "transit"] if args.mode == "all" else [args.mode]
+    jobs = []
+    if "walk" in modes:
+        jobs.append(("Walk", "OSM foot router", lambda: osrm("foot", a, b)))
+    if "cycle" in modes:
+        jobs.append(("Cycle", "OSM bike router", lambda: osrm("bike", a, b)))
+        if london:
+            jobs.append(("Cycle", "TfL", lambda: tfl("cycle", a, b, when, args.arrive)))
+    if "transit" in modes:
+        if london:
+            modes_tfl = "tube,bus,dlr,overground,elizabeth-line,national-rail,tram,walking"
+            jobs.append(("Transit", "TfL", lambda: tfl(modes_tfl, a, b, when, args.arrive)))
+        else:
+            jobs.append(("Transit", "Google", lambda: google("TRANSIT", a, b, when, args.arrive)))
+
+    failed = False
+    for label, source, job in jobs:
+        try:
+            minutes, metres, detail = job()
+            line = f"{label:8} {minutes:4.0f} min  {km(metres):>7}  ({source})"
+            print(line + (f"\n         {detail}" if detail else ""))
+        except RouteError as e:
+            failed = True
+            print(f"{label:8} unavailable ({source}): {e}")
+    sys.exit(1 if failed and len(jobs) == 1 else 0)
+
+
+if __name__ == "__main__":
+    main()
