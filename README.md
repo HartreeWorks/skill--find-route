@@ -49,6 +49,10 @@ How long does it take to get from King's Cross station to the Tate Modern on foo
 
 You get walking, cycling and public-transport times with distances, the public-transport route, and the source of each figure.
 
+## Updates
+
+At most once a day, the skill checks for a new release. When there is one, your agent shows what changed, reviews the code changes, and asks whether to update now, update automatically from now on, or not now. Automatic updates wait three days after a release first appears. To stop the checks, ask your agent to run `scripts/check-update.sh --off`.
+
 ## Documentation
 
 See [SKILL.md](./SKILL.md) for complete documentation and usage instructions.

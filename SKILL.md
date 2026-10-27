@@ -7,6 +7,16 @@ description: Travel time and distance between two places by walking, cycling or 
 
 A journey time in a report comes from this tool, never from memory or a straight-line guess.
 
+## Before starting: check for updates
+
+If `scripts/check-update.sh` exists in this skill's folder, run `bash <this skill's folder>/scripts/check-update.sh` from the user's project folder. It checks at most once a day and prints nothing when the skill is current.
+
+- **It reports an update:** run it with `--diff` and read the code changes. Show the user the release notes and a short summary of the changes, flagging anything the notes do not explain. Ask whether to update now, update now and automatically from now on, or not now. For the first run it with `--apply`; for the second run it with `--enable-auto`, then `--apply`; for the third carry on.
+- **It reports an automatic update:** run it with `--diff` and read the changes. If they match the release notes and do nothing risky, run it with `--apply` and tell the user in one line. Otherwise show the user your concerns and ask.
+- **After `--apply` succeeds:** re-read this SKILL.md before continuing.
+
+## Looking up a route
+
 Run `~/.agents/skills/find-route/scripts/route "FROM" "TO"` (`--help` for options). Places can be a UK postcode, an address with city and country, or `lat,lng`.
 
 - `--mode walk|cycle|transit|all` (default `all`).
